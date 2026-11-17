@@ -1,0 +1,6 @@
+environment: test
+replicaCount: 2
+tests:
+  enabled: true
+envFrom:
+  - configMapRef: {name: infrapilot-otlp}

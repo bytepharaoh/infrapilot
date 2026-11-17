@@ -1,0 +1,25 @@
+environment: test
+tests:
+  enabled: true
+envFrom:
+  - configMapRef: {name: infrapilot-otlp}
+extraEnv:
+  - name: REDIS_ADDR
+    value: redis.infrapilot-deps.svc:6379
+  - name: KAFKA_BROKERS
+    value: kafka.infrapilot-deps.svc:9092
+networkPolicy:
+  ingress: []
+  egress:
+    rules:
+      - to:
+          - podSelector: {matchLabels: {app.kubernetes.io/name: control-plane}}
+        ports: [{port: 9090, protocol: TCP}]
+      - to:
+          - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: infrapilot-deps}}
+            podSelector: {matchLabels: {app: redis}}
+        ports: [{port: 6379, protocol: TCP}]
+      - to:
+          - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: infrapilot-deps}}
+            podSelector: {matchLabels: {app: kafka}}
+        ports: [{port: 9092, protocol: TCP}]

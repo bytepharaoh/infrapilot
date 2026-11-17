@@ -1,0 +1,20 @@
+groups:
+  - name: infrapilot-telemetry-ingestion
+    rules:
+      - alert: TelemetryIngestionUnavailable
+        expr: |
+          sum by (job) (rate(telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="unavailable"}[5m]))
+            / sum by (job) (rate(telemetry_ingestion_exports_total{job="telemetry-ingestion"}[5m])) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "More than 5% of OTLP exports cannot reach a required dependency"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/telemetry-ingestion.md#telemetryingestionunavailable
+      - alert: TelemetryIngestionBackpressure
+        expr: |
+          sum by (job) (rate(telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="busy"}[5m])) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "OTLP admission is rejecting more than one export per second"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/telemetry-ingestion.md#telemetryingestionbackpressure

@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package infrapilot.checks.v1;
+
+import "google/protobuf/timestamp.proto";
+
+enum CheckKind {
+  CHECK_KIND_UNSPECIFIED = 0;
+  CHECK_KIND_HTTP = 1;
+  CHECK_KIND_TCP = 2;
+  CHECK_KIND_TLS = 3;
+  CHECK_KIND_DNS = 4;
+  CHECK_KIND_ICMP = 5;
+}
+
+enum CheckOutcome {
+  CHECK_OUTCOME_UNSPECIFIED = 0;
+  CHECK_OUTCOME_SUCCESS = 1;
+  CHECK_OUTCOME_FAILURE = 2;
+}
+
+message Thresholds {
+  optional double max_duration_ms = 1;
+  optional uint32 min_tls_days = 2;
+}
+
+message CheckSpec {
+  string resource_id = 1;
+  CheckKind kind = 2;
+  string target = 3;
+  uint32 port = 4;
+  uint32 interval_seconds = 5;
+  uint32 timeout_seconds = 6;
+  bool enabled = 7;
+  Thresholds thresholds = 8;
+}
+
+message Check {
+  string id = 1;
+  string organization_id = 2;
+  string project_id = 3;
+  CheckSpec spec = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// CheckResult is a completed scheduled probe. The envelope carries the organization ID.
+message CheckResult {
+  string project_id = 1;
+  string resource_id = 2;
+  string check_id = 3;
+  google.protobuf.Timestamp scheduled_at = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  uint64 lease_epoch = 6;
+  CheckOutcome outcome = 7;
+  double duration_ms = 8;
+  string detail = 9;
+  Thresholds thresholds = 10;
+  uint64 threshold_version = 11;
+  optional uint32 tls_days_remaining = 12;
+}
+
+service CheckService {
+  rpc CreateCheck(CreateCheckRequest) returns (CreateCheckResponse);
+  rpc GetCheck(GetCheckRequest) returns (GetCheckResponse);
+  rpc ListChecks(ListChecksRequest) returns (ListChecksResponse);
+  rpc UpdateCheck(UpdateCheckRequest) returns (UpdateCheckResponse);
+  rpc DeleteCheck(DeleteCheckRequest) returns (DeleteCheckResponse);
+}
+
+message CreateCheckRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  CheckSpec spec = 3;
+  string idempotency_key = 4;
+}
+
+message CreateCheckResponse {
+  Check check = 1;
+}
+
+message GetCheckRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  string check_id = 3;
+}
+
+message GetCheckResponse {
+  Check check = 1;
+}
+
+message ListChecksRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+
+message ListChecksResponse {
+  repeated Check checks = 1;
+  string next_page_token = 2;
+}
+
+message UpdateCheckRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  string check_id = 3;
+  CheckSpec spec = 4;
+}
+
+message UpdateCheckResponse {
+  Check check = 1;
+}
+
+message DeleteCheckRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  string check_id = 3;
+}
+
+message DeleteCheckResponse {}

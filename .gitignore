@@ -1,0 +1,41 @@
+# Local-only engineering evidence — never commit
+/.local-reports/
+/.local-evidence/
+/.local-reviews/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Go
+/bin/
+*.test
+*.out
+coverage.*
+*.prof
+
+# Python
+__pycache__/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Helm packaged dependencies (rebuilt by helm dependency update)
+**/charts/*.tgz
+
+# Stray `go build` outputs of command packages
+/tests/conformance

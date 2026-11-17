@@ -1,0 +1,154 @@
+# Baseline recording rules and alerts for every InfraPilot Go service (project requirements). Metric names come
+# from pkg/ and are identical on the pull (ServiceMonitor) and push (OTLP → remote write) paths.
+# Runbook: docs/runbooks/platform.md · unit tests: observability/prometheus/tests/
+groups:
+  - name: infrapilot-slo-recording
+    rules:
+      # Public API availability SLO: 99.9 % non-5xx over 30 days (docs/architecture/overview.md §6).
+      - record: job:http_requests_errors:ratio_rate5m
+        expr: sum by (job) (rate(http_server_requests_total{status=~"5.."}[5m])) / sum by (job) (rate(http_server_requests_total[5m]))
+      - record: job:http_requests_errors:ratio_rate30m
+        expr: sum by (job) (rate(http_server_requests_total{status=~"5.."}[30m])) / sum by (job) (rate(http_server_requests_total[30m]))
+      - record: job:http_requests_errors:ratio_rate1h
+        expr: sum by (job) (rate(http_server_requests_total{status=~"5.."}[1h])) / sum by (job) (rate(http_server_requests_total[1h]))
+      - record: job:http_requests_errors:ratio_rate6h
+        expr: sum by (job) (rate(http_server_requests_total{status=~"5.."}[6h])) / sum by (job) (rate(http_server_requests_total[6h]))
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_server_requests_total[5m]))
+
+  - name: infrapilot-go-service
+    rules:
+      # Pull path: a scraped InfraPilot target is down. Only targets labelled part-of=infrapilot by the
+      # ServiceMonitor (infrapilot-lib) are covered, so third-party scrape jobs never page us.
+      - alert: ServiceTargetDown
+        expr: up{app_kubernetes_io_part_of="infrapilot"} == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Scrape target {{ $labels.job }}/{{ $labels.instance }} is down"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#servicetargetdown
+
+      # Push path: a service that reported within the last hour stopped reporting (no `up` exists for
+      # pushed series; health_ready goes stale 5 minutes after the last push).
+      - alert: ServiceTelemetryAbsent
+        expr: max by (job) (max_over_time(health_ready[1h])) unless max by (job) (health_ready)
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} stopped pushing telemetry"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#servicetelemetryabsent
+
+      # Only instances that are still reporting: a terminated pod's last pushed sample is health_ready=0
+      # (the gate closes on shutdown) and pushed series carry no staleness marker, so without the freshness
+      # condition every rollout would raise this alert for up to 5 minutes.
+      - alert: ServiceNotReady
+        expr: |
+          (max by (job, instance) (health_ready) == 0)
+            and on (job, instance)
+          (time() - max by (job, instance) (timestamp(health_ready)) < 60)
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} has reported not-ready for 5 minutes"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#servicenotready
+
+      - alert: DependencyCheckFailing
+        expr: min by (job, instance, check) (health_check_up) == 0
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "Dependency check {{ $labels.check }} failing on {{ $labels.job }}/{{ $labels.instance }}"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#dependencycheckfailing
+
+      # Multi-window burn-rate alerts (Google SRE workbook): 14.4x burns 2 % of the 30-day budget in 1 h,
+      # 6x burns 5 % in 6 h. Both windows must agree so a short spike does not page.
+      - alert: HttpErrorBudgetBurnFast
+        expr: |
+          job:http_requests_errors:ratio_rate1h > (14.4 * 0.001)
+            and job:http_requests_errors:ratio_rate5m > (14.4 * 0.001)
+            and job:http_requests:rate5m > 0.5
+        for: 2m
+        labels: { severity: critical, slo: availability }
+        annotations:
+          summary: "{{ $labels.job }} is burning its 99.9 % availability budget 14x too fast"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#httperrorbudgetburn
+
+      - alert: HttpErrorBudgetBurnSlow
+        expr: |
+          job:http_requests_errors:ratio_rate6h > (6 * 0.001)
+            and job:http_requests_errors:ratio_rate30m > (6 * 0.001)
+            and job:http_requests:rate5m > 0.5
+        for: 15m
+        labels: { severity: warning, slo: availability }
+        annotations:
+          summary: "{{ $labels.job }} is burning its 99.9 % availability budget 6x too fast"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#httperrorbudgetburn
+
+      - alert: HttpHighErrorRate
+        expr: job:http_requests_errors:ratio_rate5m > 0.05 and job:http_requests:rate5m > 0.5
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }}: more than 5% of HTTP responses are 5xx"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#httphigherrorrate
+
+      - alert: HttpHighLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum by (job, le) (rate(http_server_request_duration_seconds_bucket[5m]))) > 0.3
+            and job:http_requests:rate5m > 0.5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.job }}: HTTP p99 latency above the 300 ms SLO"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#httphighlatencyp99
+
+      - alert: GrpcHighErrorRate
+        expr: |
+          (
+            sum by (job) (rate(grpc_server_handled_total{grpc_code=~"Internal|Unknown|Unavailable|DataLoss"}[5m]))
+              /
+            sum by (job) (rate(grpc_server_handled_total[5m]))
+          ) > 0.05
+            and sum by (job) (rate(grpc_server_handled_total[5m])) > 0.5
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }}: more than 5% of gRPC calls fail with server errors"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#grpchigherrorrate
+
+      - alert: GoroutineGrowth
+        expr: go_goroutines > 5000 and deriv(go_goroutines[30m]) > 0.5
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }}: goroutines keep growing (possible leak)"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#goroutinegrowth
+
+      - alert: PgPoolSaturated
+        expr: |
+          max by (job, instance, pool) (pgxpool_acquired_conns) / max by (job, instance, pool) (pgxpool_max_conns) > 0.9
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }}: Postgres pool {{ $labels.pool }} above 90% utilisation"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#pgpoolsaturated
+
+      - alert: PgPoolWaiting
+        expr: sum by (job, instance, pool) (rate(pgxpool_empty_acquire_total[5m])) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }}: requests wait for Postgres connections ({{ $labels.pool }})"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#pgpoolsaturated
+
+  - name: infrapilot-workload-identity
+    rules:
+      # Workload certificates live 24 h and renew at 16 h (ADR-0025). Under 6 h left means rotation is stuck;
+      # at expiry every mTLS call of the workload fails.
+      - alert: TLSCertificateExpiringSoon
+        expr: min by (job, instance, role, name) (tls_certificate_expiry_timestamp_seconds) - time() < 6 * 3600
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }}/{{ $labels.instance }} {{ $labels.role }} certificate expires in under 6 hours"
+          runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/platform.md#tlscertificateexpiringsoon

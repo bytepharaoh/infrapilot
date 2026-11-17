@@ -1,0 +1,45 @@
+# Broker endpoints, certificate material, Redis ACL credentials and allowed network peers are environment-specific.
+environment: ""
+image:
+  repository: infrapilot/telemetry-ingestion
+  tag: ""
+replicaCount: 2
+ports:
+  http: 4318
+  admin: 8081
+  grpc: 4317
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+tls:
+  enabled: true
+  # The workload certificate authenticates this service to control-plane. The public gRPC listener
+  # uses server TLS plus bearer credentials. Production ingress provides the public-facing certificate.
+  clientAuth: false
+env:
+  - name: CONTROLPLANE_TARGET
+    value: dns:///control-plane-grpc.infrapilot.svc:9090
+  - name: CONTROLPLANE_SERVER_NAME
+    value: control-plane-grpc.infrapilot.svc
+  - name: CONTROLPLANE_SERVER_IDENTITY
+    value: spiffe://infrapilot.local/ns/infrapilot/sa/control-plane
+  - name: CONTROLPLANE_TLS_CERT_FILE
+    value: /etc/infrapilot/tls/tls.crt
+  - name: CONTROLPLANE_TLS_KEY_FILE
+    value: /etc/infrapilot/tls/tls.key
+  - name: CONTROLPLANE_TLS_CA_FILE
+    value: /etc/infrapilot/tls/ca.crt
+  - name: CONTROLPLANE_TIMEOUT
+    value: 2s
+  - name: REDIS_PASSWORD
+    valueFrom:
+      secretKeyRef: {name: telemetry-ingestion-redis, key: password}
+networkPolicy:
+  ingress:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+  egress:
+    rules: []

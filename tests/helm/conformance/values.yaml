@@ -1,0 +1,64 @@
+nameOverride: conformance
+image:
+  repository: infrapilot/conformance
+  tag: dev
+  pullPolicy: IfNotPresent
+replicaCount: 2
+environment: test
+env:
+  - name: LOG_LEVEL
+    value: info
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: conformance-postgres
+        key: app-url
+envFrom:
+  - configMapRef:
+      name: conformance-otlp
+# OTLP collector reachable from the kind nodes (docker compose obs profile on the host).
+otlp:
+  endpoint: host.docker.internal:4317
+  insecure: true
+  # Where the collector lives, as seen from the pods. `make deploy` passes the collector's exact /32 (resolved
+  # inside the kind node); this fallback excludes every private range so the rule cannot reach other workloads.
+  egressCIDR: 0.0.0.0/0
+  egressExcept: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+shutdown:
+  delaySeconds: 2
+  timeoutSeconds: 20
+tests:
+  enabled: true
+migration:
+  enabled: true
+  args: [migrate]
+  env:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: conformance-postgres
+          key: migrator-url
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: conformance-postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+networkPolicy:
+  enabled: true
+  # No peers call this test service except its own test pods (allowed by tests.enabled).
+  ingress: []
+  egress:
+    rules:
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: conformance-postgres
+        ports:
+          - port: 5432
+            protocol: TCP
+# Test-only PostgreSQL deployed next to the service (never used by real service charts).
+postgres:
+  image: postgres:17.6-alpine

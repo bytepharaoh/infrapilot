@@ -1,0 +1,37 @@
+environment: ""
+image:
+  repository: infrapilot/query-service
+  tag: ""
+replicaCount: 2
+ports:
+  http: 0
+  admin: 8081
+  grpc: 9090
+resources:
+  requests: {cpu: 100m, memory: 96Mi}
+  limits: {memory: 256Mi}
+tls:
+  enabled: true
+env:
+  - {name: EDGE_IDENTITIES, value: "spiffe://infrapilot.local/ns/infrapilot/sa/api-gateway"}
+  - {name: CONTROLPLANE_TARGET, value: "dns:///control-plane-grpc.infrapilot.svc:9090"}
+  - {name: CONTROLPLANE_SERVER_NAME, value: "control-plane-grpc.infrapilot.svc"}
+  - {name: CONTROLPLANE_SERVER_IDENTITY, value: "spiffe://infrapilot.local/ns/infrapilot/sa/control-plane"}
+  - {name: CONTROLPLANE_TLS_CERT_FILE, value: /etc/infrapilot/tls/tls.crt}
+  - {name: CONTROLPLANE_TLS_KEY_FILE, value: /etc/infrapilot/tls/tls.key}
+  - {name: CONTROLPLANE_TLS_CA_FILE, value: /etc/infrapilot/tls/ca.crt}
+  - {name: STREAMPROCESSOR_TARGET, value: "dns:///stream-processor-grpc.infrapilot.svc:9090"}
+  - {name: STREAMPROCESSOR_SERVER_NAME, value: "stream-processor-grpc.infrapilot.svc"}
+  - {name: STREAMPROCESSOR_SERVER_IDENTITY, value: "spiffe://infrapilot.local/ns/infrapilot/sa/stream-processor"}
+  - {name: STREAMPROCESSOR_TLS_CERT_FILE, value: /etc/infrapilot/tls/tls.crt}
+  - {name: STREAMPROCESSOR_TLS_KEY_FILE, value: /etc/infrapilot/tls/tls.key}
+  - {name: STREAMPROCESSOR_TLS_CA_FILE, value: /etc/infrapilot/tls/ca.crt}
+networkPolicy:
+  ingress:
+    - podSelector: {matchLabels: {app.kubernetes.io/name: api-gateway}}
+  egress:
+    rules:
+      - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: control-plane}}}]
+        ports: [{port: 9090, protocol: TCP}]
+      - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: stream-processor}}}]
+        ports: [{port: 9090, protocol: TCP}]

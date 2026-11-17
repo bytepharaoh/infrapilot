@@ -1,0 +1,516 @@
+package httpserver_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/goleak"
+
+	"github.com/bytepharaoh/infrapilot/pkg/health"
+	"github.com/bytepharaoh/infrapilot/pkg/httpserver"
+	"github.com/bytepharaoh/infrapilot/pkg/log"
+)
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
+
+func testConfig() httpserver.Config {
+	return httpserver.Config{
+		Addr: "127.0.0.1:0", ReadHeaderTimeout: time.Second, ReadTimeout: 5 * time.Second,
+		WriteTimeout: 10 * time.Second, IdleTimeout: 5 * time.Second,
+	}
+}
+
+func startServer(t *testing.T, h http.Handler) (*httpserver.Server, <-chan error) {
+	t.Helper()
+	s, err := httpserver.New(t.Context(), testConfig(), h)
+	require.NoError(t, err)
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(t.Context()) }()
+	return s, runErr
+}
+
+func get(t *testing.T, s *httpserver.Server, path string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+s.Addr().String()+path, http.NoBody)
+	require.NoError(t, err)
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	return resp.StatusCode, body
+}
+
+func TestNew_Validation(t *testing.T) {
+	t.Parallel()
+	_, err := httpserver.New(t.Context(), testConfig(), nil)
+	require.Error(t, err)
+	cfg := testConfig()
+	cfg.ReadTimeout = 0
+	_, err = httpserver.New(t.Context(), cfg, http.NotFoundHandler())
+	require.Error(t, err)
+	cfg = testConfig()
+	cfg.Addr = "256.256.256.256:1"
+	_, err = httpserver.New(t.Context(), cfg, http.NotFoundHandler())
+	require.Error(t, err)
+}
+
+func TestServer_ShutdownDrainsInFlight(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "done")
+	})
+	s, runErr := startServer(t, mux)
+
+	type result struct {
+		code int
+		body string
+		err  error
+	}
+	res := make(chan result, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+s.Addr().String()+"/slow", http.NoBody)
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			res <- result{err: err}
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		res <- result{code: resp.StatusCode, body: string(b)}
+	}()
+	<-started
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- s.Shutdown(ctx)
+	}()
+
+	// Listener is closed promptly: new connections are refused while the in-flight request continues.
+	require.Eventually(t, func() bool {
+		c, err := net.DialTimeout("tcp", s.Addr().String(), 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+		}
+		return err != nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	close(release)
+	r := <-res
+	require.NoError(t, r.err)
+	require.Equal(t, http.StatusOK, r.code)
+	require.Equal(t, "done", r.body)
+	require.NoError(t, <-shutdownDone)
+	require.NoError(t, <-runErr)
+}
+
+func TestServer_ShutdownDeadlineForcesClose(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /stuck", func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done() // the forced close cancels the request context
+		w.WriteHeader(http.StatusOK)
+	})
+	s, runErr := startServer(t, mux)
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+s.Addr().String()+"/stuck", http.NoBody)
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-started
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := s.Shutdown(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(start), 2*time.Second)
+	require.NoError(t, <-runErr, "Run returns after the forced close")
+}
+
+func TestMiddleware_RecoverWritesProblem(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger, err := log.New(log.Config{Level: "info"}, &buf, "s", "v", "e")
+	require.NoError(t, err)
+	h := httpserver.Chain(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("kaboom") }),
+		httpserver.RequestID(), httpserver.Recover(logger))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", http.NoBody))
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	var p httpserver.Problem
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &p))
+	require.Equal(t, "internal", p.Code)
+	require.Equal(t, "/x", p.Instance)
+	require.Contains(t, buf.String(), "kaboom")
+	require.Contains(t, buf.String(), "request_id")
+	require.NotContains(t, rec.Body.String(), "kaboom", "panic details never reach the client")
+
+	abort := httpserver.Chain(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) }),
+		httpserver.Recover(logger))
+	require.PanicsWithValue(t, http.ErrAbortHandler, func() {
+		abort.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", http.NoBody))
+	})
+}
+
+func TestMiddleware_RequestID(t *testing.T) {
+	t.Parallel()
+	var seen string
+	h := httpserver.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = httpserver.RequestIDFromContext(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}), httpserver.RequestID())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	req.Header.Set(httpserver.RequestIDHeader, "client-id-1")
+	h.ServeHTTP(rec, req)
+	require.Equal(t, "client-id-1", seen)
+	require.Equal(t, "client-id-1", rec.Header().Get(httpserver.RequestIDHeader))
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	req.Header.Set(httpserver.RequestIDHeader, `<script>"x"</script>`)
+	h.ServeHTTP(rec, req)
+	require.NotEmpty(t, seen)
+	require.NotContains(t, seen, " ")
+	require.Equal(t, seen, rec.Header().Get(httpserver.RequestIDHeader))
+}
+
+func TestMiddleware_MetricsUseRoutePattern(t *testing.T) {
+	t.Parallel()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.WithoutCancel(t.Context())) })
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	t.Cleanup(func() { _ = tp.Shutdown(context.WithoutCancel(t.Context())) })
+
+	mws, err := httpserver.Standard(httpserver.Options{Logger: log.Discard(), TracerProvider: tp, MeterProvider: mp, ServerName: "test"})
+	require.NoError(t, err)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /orgs/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	h := httpserver.Chain(mux, mws...)
+
+	for _, id := range []string{"a", "b", "c"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/orgs/"+id, http.NoBody))
+		require.Equal(t, http.StatusTeapot, rec.Code)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", http.NoBody))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	counts := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "http_server_requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				route, _ := dp.Attributes.Value(attribute.Key("route"))
+				status, _ := dp.Attributes.Value(attribute.Key("status"))
+				counts[route.AsString()+" "+status.AsString()] = dp.Value
+			}
+		}
+	}
+	require.Equal(t, int64(3), counts["/orgs/{id} 418"], "one series per route pattern, not per URL: %v", counts)
+	require.Equal(t, int64(1), counts["unmatched 404"])
+
+	spans := exporter.GetSpans()
+	require.NotEmpty(t, spans)
+	require.Equal(t, "GET /orgs/{id}", spans[0].Name)
+}
+
+func TestMiddleware_AccessLogLevels(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger, err := log.New(log.Config{Level: "info"}, &buf, "s", "v", "e")
+	require.NoError(t, err)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /boom", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
+	h := httpserver.Chain(mux, httpserver.AccessLog(logger))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", http.NoBody))
+	require.Empty(t, buf.String(), "health probes are logged at debug")
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/boom", http.NoBody))
+	require.Contains(t, buf.String(), `"level":"WARN"`)
+	require.Contains(t, buf.String(), `"status":502`)
+}
+
+func TestAdminHandler(t *testing.T) {
+	t.Parallel()
+	reg := health.NewRegistry()
+	reg.SetReady(true)
+	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "up 1\n") })
+	h := httpserver.AdminHandler(reg.LivenessHandler(), reg.ReadinessHandler(), metrics, true)
+
+	for path, want := range map[string]int{"/healthz": 200, "/readyz": 200, "/metrics": 200, "/debug/pprof/": 200, "/other": 404} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, http.NoBody))
+		require.Equal(t, want, rec.Code, path)
+	}
+	noPprof := httpserver.AdminHandler(reg.LivenessHandler(), reg.ReadinessHandler(), metrics, false)
+	rec := httptest.NewRecorder()
+	noPprof.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/", http.NoBody))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestServer_RunEndToEnd(t *testing.T) {
+	t.Parallel()
+	s, runErr := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }))
+	code, body := get(t, s, "/")
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, "ok", string(body))
+	require.NoError(t, s.Shutdown(t.Context()))
+	require.NoError(t, <-runErr)
+	require.NoError(t, s.Shutdown(t.Context()), "idempotent")
+	_, err := net.DialTimeout("tcp", s.Addr().String(), 200*time.Millisecond)
+	require.Error(t, err, "listener closed")
+}
+
+// collectCounts returns http_server_requests_total by "method route status".
+func collectCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	counts := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "http_server_requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				method, _ := dp.Attributes.Value(attribute.Key("method"))
+				route, _ := dp.Attributes.Value(attribute.Key("route"))
+				status, _ := dp.Attributes.Value(attribute.Key("status"))
+				counts[method.AsString()+" "+route.AsString()+" "+status.AsString()] += dp.Value
+			}
+		}
+	}
+	return counts
+}
+
+func standardStack(t *testing.T, logger *slog.Logger, maxBody int64) (http.Handler, *sdkmetric.ManualReader, *http.ServeMux) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.WithoutCancel(t.Context())) })
+	mws, err := httpserver.Standard(httpserver.Options{Logger: logger, TracerProvider: tracenoop.NewTracerProvider(),
+		MeterProvider: mp, ServerName: "t", MaxBodyBytes: maxBody})
+	require.NoError(t, err)
+	mux := http.NewServeMux()
+	return httpserver.Chain(mux, mws...), reader, mux
+}
+
+func TestStandard_PanicIsCountedAndLoggedAs500(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger, err := log.New(log.Config{Level: "info"}, &buf, "s", "v", "e")
+	require.NoError(t, err)
+	h, reader, mux := standardStack(t, logger, 0)
+	mux.HandleFunc("GET /v1/panic", func(http.ResponseWriter, *http.Request) { panic("boom") })
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/panic", http.NoBody))
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Equal(t, int64(1), collectCounts(t, reader)["GET /v1/panic 500"], "panics are server errors in RED metrics")
+	require.Contains(t, buf.String(), `"msg":"http request"`, "the access log records the request")
+	require.Contains(t, buf.String(), `"status":500`)
+}
+
+func TestStandard_MethodLabelIsBounded(t *testing.T) {
+	t.Parallel()
+	h, reader, _ := standardStack(t, log.Discard(), 0)
+	for _, m := range []string{"FOO1", "FOO2", "PROPFIND"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(m, "/x", http.NoBody))
+	}
+	counts := collectCounts(t, reader)
+	require.Len(t, counts, 1, "%v", counts)
+	require.Equal(t, int64(3), counts["_OTHER unmatched 404"])
+}
+
+func TestStandard_BodyLimit(t *testing.T) {
+	t.Parallel()
+	h, _, mux := standardStack(t, log.Discard(), 16)
+	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpserver.WriteProblem(w, r, http.StatusRequestEntityTooLarge, "validation_failed", "too large")
+			return
+		}
+		_, _ = w.Write(b)
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader("small")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(strings.Repeat("x", 64))))
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, "declared Content-Length rejected up front")
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/echo", io.NopCloser(strings.NewReader(strings.Repeat("x", 64))))
+	req.ContentLength = -1 // chunked: limit enforced while reading
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+}
+
+func TestRecover_AbortsWhenResponseAlreadyStarted(t *testing.T) {
+	t.Parallel()
+	h := httpserver.Chain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "partial")
+		panic("late")
+	}), httpserver.Recover(log.Discard()))
+	require.PanicsWithValue(t, http.ErrAbortHandler, func() {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
+	}, "a half-written body must not be completed with a problem document")
+}
+
+func TestStatusWriter_FlushAnd1xx(t *testing.T) {
+	t.Parallel()
+	h, reader, mux := standardStack(t, log.Discard(), 0)
+	mux.HandleFunc("GET /stream", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		_, _ = io.WriteString(w, "chunk")
+		if f, ok := w.(http.Flusher); ok { // asserted below through rec.Flushed
+			f.Flush()
+		}
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream", http.NoBody))
+	require.True(t, rec.Flushed)
+	require.Equal(t, int64(1), collectCounts(t, reader)["GET /stream 200"], "1xx is not the final status")
+}
+
+func TestServer_ShutdownWithoutRunClosesListener(t *testing.T) {
+	t.Parallel()
+	s, err := httpserver.New(t.Context(), testConfig(), http.NotFoundHandler())
+	require.NoError(t, err)
+	addr := s.Addr().String()
+	require.NoError(t, s.Shutdown(t.Context()))
+	c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err == nil {
+		_ = c.Close()
+	}
+	require.Error(t, err, "listener released even though Run never started")
+}
+
+func TestEdgeRequestID_NeverTrustsClientID(t *testing.T) {
+	t.Parallel()
+	var seen string
+	h := httpserver.EdgeRequestID()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = httpserver.RequestIDFromContext(r.Context())
+	}))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	req.Header.Set(httpserver.RequestIDHeader, "client-chosen-id")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.NotEqual(t, "client-chosen-id", seen)
+	require.Equal(t, seen, rec.Header().Get(httpserver.RequestIDHeader))
+	_, err := uuid.Parse(seen)
+	require.NoError(t, err)
+}
+
+func TestWriteProblemBody_FieldErrors(t *testing.T) {
+	t.Parallel()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/x", nil)
+	rec := httptest.NewRecorder()
+	httpserver.WriteProblemBody(rec, req, httpserver.Problem{Status: 400, Code: "validation_failed", Title: "bad",
+		Errors: []httpserver.FieldError{{Field: "name", Message: "required"}}})
+	require.Equal(t, "application/problem+json", rec.Header().Get("Content-Type"))
+	require.JSONEq(t, `{"type":"about:blank","title":"bad","status":400,"instance":"/v1/x","code":"validation_failed",
+		"trace_id":"00000000000000000000000000000000","errors":[{"field":"name","message":"required"}]}`, rec.Body.String())
+}
+
+// TestRouteFrom_PatternSurvivesRequestCopies: middleware between the instrumentation and the mux that replaces the
+// request (r.WithContext, as authentication does) must not turn every route into "unmatched".
+func TestRouteFrom_PatternSurvivesRequestCopies(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	metrics, err := httpserver.Metrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	require.NoError(t, err)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/orgs/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	type ctxKey struct{}
+	copying := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, "principal")))
+		})
+	}
+	unauthenticated := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	api := httpserver.Chain(mux, httpserver.RouteFrom(mux), copying, unauthenticated)
+	h := httpserver.Chain(api, httpserver.Tracing(tp, "svc"), metrics, httpserver.AccessLog(slog.New(slog.DiscardHandler)))
+
+	for _, auth := range []string{"Bearer x", "Bearer x", ""} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/orgs/42", http.NoBody)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	nope := httptest.NewRequest(http.MethodGet, "/v1/nope", http.NoBody)
+	nope.Header.Set("Authorization", "Bearer x")
+	h.ServeHTTP(httptest.NewRecorder(), nope)
+
+	counts := collectCounts(t, reader)
+	require.Equal(t, map[string]int64{
+		"GET /v1/orgs/{id} 418": 2,
+		"GET /v1/orgs/{id} 401": 1, // rejected before reaching the mux, still attributed to its route
+		"GET unmatched 404":     1,
+	}, counts)
+	names := map[string]int{}
+	for _, s := range exporter.GetSpans() {
+		names[s.Name]++
+	}
+	require.Equal(t, 3, names["GET /v1/orgs/{id}"], "spans are named after the route: %v", names)
+}

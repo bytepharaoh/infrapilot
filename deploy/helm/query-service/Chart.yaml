@@ -1,0 +1,10 @@
+apiVersion: v2
+name: query-service
+description: Tenant-authorized bounded telemetry and check-result reads.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: infrapilot-lib
+    version: 0.4.0
+    repository: file://../infrapilot-lib

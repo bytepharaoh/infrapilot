@@ -1,0 +1,1123 @@
+openapi: 3.0.3
+info:
+  title: InfraPilot Public API
+  version: 1.0.0
+  description: |
+    Public REST API of InfraPilot. Conventions (ADR-0003):
+
+    * Versioned by path prefix `/v1`.
+    * Errors are RFC 9457 problem documents (`application/problem+json`, schema `Problem`).
+    * List endpoints use cursor pagination: `limit` + `cursor` query parameters, `next_cursor` in the response.
+    * `POST` requests that create resources accept an `Idempotency-Key` header; replays return the original result.
+    * Authentication is either a user access token (OIDC, `Authorization: Bearer <jwt>`) or a project API key
+      (`X-API-Key: ipk_...`). API keys carry scopes (`ingest`, `read`, `write`).
+  contact:
+    name: InfraPilot
+  license:
+    name: Apache-2.0
+servers:
+  - url: https://api.infrapilot.example.com/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local gateway
+security:
+  - OIDC: []
+  - ApiKey: []
+tags:
+  - name: meta
+    description: Service metadata
+  - name: organizations
+    description: Tenants. The caller's organizations are those they are a member of.
+  - name: members
+    description: Organization memberships and roles (owner, admin, operator, viewer).
+  - name: projects
+    description: Projects group resources and API keys inside an organization.
+  - name: resources
+    description: Inventory of monitored resources in a project.
+  - name: checks
+    description: Scheduled checks and their results.
+  - name: telemetry
+    description: Metric data points for a monitored resource.
+  - name: api-keys
+    description: Project-scoped API keys. The secret is returned once, at creation.
+  - name: audit
+    description: Append-only audit log of membership, role, key, project and organization changes.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Gateway health
+      description: Liveness of the public API edge. Does not reflect downstream services.
+      tags: [meta]
+      security: []
+      responses:
+        "200":
+          description: Gateway is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /organizations:
+    get:
+      operationId: listMyOrganizations
+      summary: List the caller's organizations
+      tags: [organizations]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Organizations the caller is a member of, with the caller's role
+          headers: &ratelimit
+            RateLimit-Limit: {$ref: "#/components/headers/RateLimitLimit"}
+            RateLimit-Remaining: {$ref: "#/components/headers/RateLimitRemaining"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OrganizationMembershipList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: createOrganization
+      summary: Create an organization (the caller becomes its owner)
+      tags: [organizations]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateOrganization"}
+      responses:
+        "201":
+          description: Created (or the original result of an idempotent replay)
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Organization"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+    get:
+      operationId: getOrganization
+      summary: Get an organization
+      tags: [organizations]
+      responses:
+        "200":
+          description: The organization
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Organization"}
+        default: {$ref: "#/components/responses/Problem"}
+    patch:
+      operationId: updateOrganization
+      summary: Rename an organization (owner, admin)
+      tags: [organizations]
+      security: [{OIDC: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateOrganization"}
+      responses:
+        "200":
+          description: The updated organization
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Organization"}
+        default: {$ref: "#/components/responses/Problem"}
+    delete:
+      operationId: deleteOrganization
+      summary: Delete an organization (owner). Data is purged after 30 days; API keys are revoked immediately.
+      tags: [organizations]
+      security: [{OIDC: []}]
+      responses:
+        "204":
+          description: Deleted
+          headers: *ratelimit
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/members:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+    get:
+      operationId: listMembers
+      summary: List members
+      tags: [members]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Members of the organization
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: addMember
+      summary: Add a user who has signed in at least once, by verified e-mail (owner, admin; only owners grant owner)
+      tags: [members]
+      security: [{OIDC: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AddMember"}
+      responses:
+        "201":
+          description: The new membership
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/members/{user_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/UserID"
+    get:
+      operationId: getMember
+      summary: Get a membership
+      tags: [members]
+      security: [{OIDC: []}]
+      responses:
+        "200":
+          description: The membership
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+        default: {$ref: "#/components/responses/Problem"}
+    patch:
+      operationId: updateMemberRole
+      summary: Change a member's role. The last owner cannot be demoted.
+      tags: [members]
+      security: [{OIDC: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateMemberRole"}
+      responses:
+        "200":
+          description: The updated membership
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+        default: {$ref: "#/components/responses/Problem"}
+    delete:
+      operationId: removeMember
+      summary: Remove a member (members may remove themselves; the last owner cannot leave)
+      tags: [members]
+      security: [{OIDC: []}]
+      responses:
+        "204":
+          description: Removed
+          headers: *ratelimit
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+    get:
+      operationId: listProjects
+      summary: List projects (an API key sees only its own project)
+      tags: [projects]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Projects
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ProjectList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: createProject
+      summary: Create a project (owner, admin)
+      tags: [projects]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateProject"}
+      responses:
+        "201":
+          description: Created (or the original result of an idempotent replay)
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Project"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+    get:
+      operationId: getProject
+      summary: Get a project
+      tags: [projects]
+      responses:
+        "200":
+          description: The project
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Project"}
+        default: {$ref: "#/components/responses/Problem"}
+    patch:
+      operationId: updateProject
+      summary: Update a project (owner, admin)
+      tags: [projects]
+      security: [{OIDC: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateProject"}
+      responses:
+        "200":
+          description: The updated project
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Project"}
+        default: {$ref: "#/components/responses/Problem"}
+    delete:
+      operationId: deleteProject
+      summary: Delete a project with its resources and revoke its API keys (owner, admin)
+      tags: [projects]
+      security: [{OIDC: []}]
+      responses:
+        "204":
+          description: Deleted
+          headers: *ratelimit
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/resources:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+    get:
+      operationId: listResources
+      summary: List resources of a project
+      tags: [resources]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: kind
+          in: query
+          required: false
+          description: Only resources of this kind.
+          schema: {$ref: "#/components/schemas/ResourceKind"}
+      responses:
+        "200":
+          description: Resources
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ResourceList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: createResource
+      summary: Add a resource (owner, admin, operator, write API keys of the project)
+      tags: [resources]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateResource"}
+      responses:
+        "201":
+          description: Created (or the original result of an idempotent replay)
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Resource"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/resources/{resource_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+      - $ref: "#/components/parameters/ResourceID"
+    get:
+      operationId: getResource
+      summary: Get a resource
+      tags: [resources]
+      responses:
+        "200":
+          description: The resource
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Resource"}
+        default: {$ref: "#/components/responses/Problem"}
+    patch:
+      operationId: updateResource
+      summary: Rename a resource or replace its labels
+      tags: [resources]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateResource"}
+      responses:
+        "200":
+          description: The updated resource
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Resource"}
+        default: {$ref: "#/components/responses/Problem"}
+    delete:
+      operationId: deleteResource
+      summary: Delete a resource
+      tags: [resources]
+      responses:
+        "204":
+          description: Deleted
+          headers: *ratelimit
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/checks:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+    get:
+      operationId: listChecks
+      summary: List scheduled checks in a project
+      tags: [checks]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Checks
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CheckList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: createCheck
+      summary: Schedule a check for a project resource
+      tags: [checks]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CheckSpec"}
+      responses:
+        "201":
+          description: Created
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Check"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/checks/{check_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+      - $ref: "#/components/parameters/CheckID"
+    get:
+      operationId: getCheck
+      summary: Get a scheduled check
+      tags: [checks]
+      responses:
+        "200":
+          description: Check
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Check"}
+        default: {$ref: "#/components/responses/Problem"}
+    put:
+      operationId: updateCheck
+      summary: Replace a scheduled check definition
+      tags: [checks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CheckSpec"}
+      responses:
+        "200":
+          description: Updated
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Check"}
+        default: {$ref: "#/components/responses/Problem"}
+    delete:
+      operationId: deleteCheck
+      summary: Delete a scheduled check
+      tags: [checks]
+      responses:
+        "204":
+          description: Deleted
+          headers: *ratelimit
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/resources/{resource_id}/checks/{check_id}/results:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+      - $ref: "#/components/parameters/ResourceID"
+      - $ref: "#/components/parameters/CheckID"
+    get:
+      operationId: listCheckResults
+      summary: Read check results for a time range of up to seven days
+      tags: [checks]
+      parameters:
+        - $ref: "#/components/parameters/StartTime"
+        - $ref: "#/components/parameters/EndTime"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Results
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CheckResultList"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/projects/{project_id}/resources/{resource_id}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ProjectID"
+      - $ref: "#/components/parameters/ResourceID"
+    get:
+      operationId: listMetricSamples
+      summary: Read metric samples for a time range of up to seven days
+      tags: [telemetry]
+      parameters:
+        - $ref: "#/components/parameters/StartTime"
+        - $ref: "#/components/parameters/EndTime"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: metric_name
+          in: query
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 255}
+      responses:
+        "200":
+          description: Metric samples
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MetricSampleList"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/api-keys:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+    get:
+      operationId: listApiKeys
+      summary: List API keys (owner, admin)
+      tags: [api-keys]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: project_id
+          in: query
+          required: false
+          description: Only keys of this project.
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          description: API keys (never their secrets)
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiKeyList"}
+        default: {$ref: "#/components/responses/Problem"}
+    post:
+      operationId: createApiKey
+      summary: Create a project API key (owner, admin). The secret is in this response only.
+      tags: [api-keys]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateApiKey"}
+      responses:
+        "201":
+          description: Created. An idempotent replay returns the key without its secret.
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CreatedApiKey"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/api-keys/{api_key_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ApiKeyID"
+    get:
+      operationId: getApiKey
+      summary: Get API key metadata (owner, admin)
+      tags: [api-keys]
+      security: [{OIDC: []}]
+      responses:
+        "200":
+          description: The key without its secret
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiKey"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/api-keys/{api_key_id}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+      - $ref: "#/components/parameters/ApiKeyID"
+    post:
+      operationId: revokeApiKey
+      summary: Revoke an API key (owner, admin). Idempotent. Edge caches may honor it for up to 30 seconds.
+      tags: [api-keys]
+      security: [{OIDC: []}]
+      responses:
+        "200":
+          description: The revoked key
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiKey"}
+        default: {$ref: "#/components/responses/Problem"}
+  /organizations/{org_id}/audit-events:
+    parameters:
+      - $ref: "#/components/parameters/OrgID"
+    get:
+      operationId: listAuditEvents
+      summary: List audit events, newest first (owner, admin)
+      tags: [audit]
+      security: [{OIDC: []}]
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Audit events
+          headers: *ratelimit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditEventList"}
+        default: {$ref: "#/components/responses/Problem"}
+components:
+  securitySchemes:
+    OIDC:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak-issued access token (Authorization Code + PKCE).
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Project-scoped API key with the `ipk_` prefix. Shown once at creation; stored hashed.
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return.
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous response's `next_cursor`.
+      required: false
+      schema:
+        type: string
+        maxLength: 512
+    OrgID:
+      name: org_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    UserID:
+      name: user_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ProjectID:
+      name: project_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ResourceID:
+      name: resource_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    CheckID:
+      name: check_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    StartTime:
+      name: start_time
+      in: query
+      required: true
+      description: Inclusive lower bound in RFC 3339 format.
+      schema: {type: string, format: date-time}
+    EndTime:
+      name: end_time
+      in: query
+      required: true
+      description: Exclusive upper bound in RFC 3339 format.
+      schema: {type: string, format: date-time}
+    ApiKeyID:
+      name: api_key_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Client-generated unique key (UUID recommended) making a create request safe to retry for 24 h. Printable ASCII only. A retry while the original is still being processed answers 409 (code `conflict`); retry it after a short delay to receive the original result. Reusing a key with a different request body answers 422.
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[\\x21-\\x7E]+$"
+  headers:
+    RateLimitLimit:
+      description: Request quota for the current window.
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema:
+        type: integer
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+  schemas:
+    CheckKind:
+      type: string
+      enum: [http, tcp, tls, dns, icmp]
+    CheckOutcome:
+      type: string
+      enum: [success, failure]
+    CheckThresholds:
+      type: object
+      additionalProperties: false
+      properties:
+        max_duration_ms: {type: number, format: double, minimum: 0, exclusiveMinimum: true}
+        min_tls_days: {type: integer, format: int32, minimum: 0, maximum: 3650}
+    CheckSpec:
+      type: object
+      additionalProperties: false
+      required: [resource_id, kind, target, interval_seconds, timeout_seconds, enabled]
+      properties:
+        resource_id: {type: string, format: uuid}
+        kind: {$ref: "#/components/schemas/CheckKind"}
+        target: {type: string, minLength: 1, maxLength: 2048}
+        port: {type: integer, format: int32, minimum: 0, maximum: 65535}
+        interval_seconds: {type: integer, format: int32, minimum: 30, maximum: 86400}
+        timeout_seconds: {type: integer, format: int32, minimum: 1, maximum: 30}
+        enabled: {type: boolean}
+        thresholds: {$ref: "#/components/schemas/CheckThresholds"}
+    Check:
+      type: object
+      required: [id, organization_id, project_id, spec, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        spec: {$ref: "#/components/schemas/CheckSpec"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    CheckList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/Check"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    CheckResult:
+      type: object
+      required: [scheduled_at, observed_at, outcome, duration_ms, detail]
+      properties:
+        scheduled_at: {type: string, format: date-time}
+        observed_at: {type: string, format: date-time}
+        outcome: {$ref: "#/components/schemas/CheckOutcome"}
+        duration_ms: {type: number, format: double}
+        detail: {type: string}
+        tls_days_remaining: {type: integer, format: int32}
+    CheckResultList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/CheckResult"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    MetricSample:
+      type: object
+      required: [metric_name, series_id, sample_id, observed_at, otlp_payload]
+      properties:
+        metric_name: {type: string}
+        series_id: {type: string}
+        sample_id: {type: string}
+        observed_at: {type: string, format: date-time}
+        int_value: {type: integer, format: int64}
+        double_value: {type: number, format: double}
+        otlp_payload: {type: string, format: byte}
+    MetricSampleList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/MetricSample"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    Problem:
+      type: object
+      description: RFC 9457 problem details, extended with a stable machine-readable `code` and the request `trace_id`.
+      required: [type, title, status, code, trace_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI identifying the problem type; `about:blank` when the status code says it all.
+          example: https://infrapilot.example.com/problems/validation
+        title:
+          type: string
+          example: Request validation failed
+        status:
+          type: integer
+          format: int32
+          minimum: 100
+          maximum: 599
+        detail:
+          type: string
+          description: Human-readable, request-specific explanation. Never contains secrets or stack traces.
+        instance:
+          type: string
+          format: uri-reference
+          description: Request path that produced the problem.
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          enum:
+            - validation_failed
+            - unauthenticated
+            - permission_denied
+            - not_found
+            - conflict
+            - idempotency_key_reused
+            - rate_limited
+            - quota_exceeded
+            - internal
+            - unavailable
+        trace_id:
+          type: string
+          description: Trace id to quote in support requests.
+        errors:
+          type: array
+          description: Field-level violations for `validation_failed`.
+          items:
+            $ref: "#/components/schemas/FieldError"
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: JSON pointer or query/header name.
+        message:
+          type: string
+    Role:
+      type: string
+      enum: [owner, admin, operator, viewer]
+    Scope:
+      type: string
+      enum: [read, write, ingest]
+      description: "`read` and `write` act on the key's project; `ingest` only sends telemetry."
+    ResourceKind:
+      type: string
+      enum: [host, service, endpoint, database, queue, container, other]
+    Name:
+      type: string
+      minLength: 1
+      maxLength: 200
+    Slug:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{1,61}[a-z0-9]$"
+      description: Lowercase letters, digits and hyphens, 3–63 characters, starting with a letter.
+    Labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 255
+      description: "Keys match ^[a-z][a-z0-9_.-]{0,62}$."
+    Organization:
+      type: object
+      required: [id, name, create_time, update_time]
+      properties:
+        id: {type: string, format: uuid}
+        name: {$ref: "#/components/schemas/Name"}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    OrganizationMembership:
+      type: object
+      required: [organization, role]
+      properties:
+        organization: {$ref: "#/components/schemas/Organization"}
+        role: {$ref: "#/components/schemas/Role"}
+    OrganizationMembershipList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/OrganizationMembership"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    CreateOrganization:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+    UpdateOrganization:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+    Member:
+      type: object
+      required: [user_id, organization_id, email, display_name, role, create_time, update_time]
+      properties:
+        user_id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        email: {type: string}
+        display_name: {type: string}
+        role: {$ref: "#/components/schemas/Role"}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    MemberList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/Member"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    AddMember:
+      type: object
+      additionalProperties: false
+      required: [email, role]
+      properties:
+        email: {type: string, format: email, maxLength: 320}
+        role: {$ref: "#/components/schemas/Role"}
+    UpdateMemberRole:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: {$ref: "#/components/schemas/Role"}
+    Project:
+      type: object
+      required: [id, organization_id, name, slug, description, create_time, update_time]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        name: {$ref: "#/components/schemas/Name"}
+        slug: {$ref: "#/components/schemas/Slug"}
+        description: {type: string, maxLength: 2000}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    ProjectList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/Project"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    CreateProject:
+      type: object
+      additionalProperties: false
+      required: [name, slug]
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        slug: {$ref: "#/components/schemas/Slug"}
+        description: {type: string, maxLength: 2000}
+    UpdateProject:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        slug: {$ref: "#/components/schemas/Slug"}
+        description: {type: string, maxLength: 2000}
+    Resource:
+      type: object
+      required: [id, organization_id, project_id, kind, name, labels, create_time, update_time]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        kind: {$ref: "#/components/schemas/ResourceKind"}
+        name: {$ref: "#/components/schemas/Name"}
+        labels: {$ref: "#/components/schemas/Labels"}
+        create_time: {type: string, format: date-time}
+        update_time: {type: string, format: date-time}
+    ResourceList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/Resource"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    CreateResource:
+      type: object
+      additionalProperties: false
+      required: [kind, name]
+      properties:
+        kind: {$ref: "#/components/schemas/ResourceKind"}
+        name: {$ref: "#/components/schemas/Name"}
+        labels: {$ref: "#/components/schemas/Labels"}
+    UpdateResource:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        labels:
+          allOf: [{$ref: "#/components/schemas/Labels"}]
+          description: Replaces the whole label set when present (an empty object clears all labels).
+    ApiKey:
+      type: object
+      required: [id, organization_id, project_id, name, prefix, scopes, create_time, created_by]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        name: {$ref: "#/components/schemas/Name"}
+        prefix:
+          type: string
+          description: Non-secret display prefix, e.g. ipk_Ab12Cd34.
+        scopes:
+          type: array
+          items: {$ref: "#/components/schemas/Scope"}
+        create_time: {type: string, format: date-time}
+        expire_time: {type: string, format: date-time, nullable: true}
+        revoke_time: {type: string, format: date-time, nullable: true}
+        created_by: {type: string, format: uuid}
+    ApiKeyList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/ApiKey"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    CreateApiKey:
+      type: object
+      additionalProperties: false
+      required: [project_id, name, scopes]
+      properties:
+        project_id: {type: string, format: uuid}
+        name: {$ref: "#/components/schemas/Name"}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          items: {$ref: "#/components/schemas/Scope"}
+        expire_time:
+          type: string
+          format: date-time
+          description: Optional; in the future and at most 400 days ahead.
+    CreatedApiKey:
+      type: object
+      required: [api_key]
+      properties:
+        api_key: {$ref: "#/components/schemas/ApiKey"}
+        secret:
+          type: string
+          description: The full key (ipk_…). Store it now; it is never returned again. Absent on idempotent replays.
+    AuditEvent:
+      type: object
+      required: [id, organization_id, actor_kind, actor_id, action, target_type, target_id, details, create_time]
+      properties:
+        id: {type: string, format: uuid}
+        organization_id: {type: string, format: uuid}
+        actor_kind:
+          type: string
+          enum: [user, api_key]
+        actor_id: {type: string, format: uuid}
+        action:
+          type: string
+          example: member.role_changed
+        target_type: {type: string}
+        target_id: {type: string}
+        details:
+          type: object
+          additionalProperties: {type: string}
+        request_id: {type: string}
+        trace_id: {type: string}
+        create_time: {type: string, format: date-time}
+    AuditEventList:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/AuditEvent"}
+        page: {$ref: "#/components/schemas/PageInfo"}
+    PageInfo:
+      type: object
+      description: Cursor pagination metadata returned by every list endpoint.
+      required: [has_more]
+      properties:
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as `cursor` to fetch the next page; absent on the last page.
+        has_more:
+          type: boolean
+  responses:
+    Problem:
+      description: Error
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"

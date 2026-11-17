@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package infrapilot.stream.v1;
+
+import "google/protobuf/timestamp.proto";
+import "infrapilot/checks/v1/checks.proto";
+import "infrapilot/telemetry/v1/metrics.proto";
+
+service StreamReadService {
+  rpc ListCheckResults(ListCheckResultsRequest) returns (ListCheckResultsResponse);
+  rpc ListMetrics(ListMetricsRequest) returns (ListMetricsResponse);
+}
+
+message ListCheckResultsRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  string resource_id = 3;
+  string check_id = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+  int32 page_size = 7;
+  string page_token = 8;
+}
+
+message ListCheckResultsResponse {
+  repeated infrapilot.checks.v1.CheckResult results = 1;
+  string next_page_token = 2;
+}
+
+message ListMetricsRequest {
+  string organization_id = 1;
+  string project_id = 2;
+  string resource_id = 3;
+  string metric_name = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+  int32 page_size = 7;
+  string page_token = 8;
+}
+
+message ListMetricsResponse {
+  repeated infrapilot.telemetry.v1.MetricsSample samples = 1;
+  string next_page_token = 2;
+}
+
+message ThresholdSignal {
+  string project_id = 1;
+  string resource_id = 2;
+  string check_id = 3;
+  google.protobuf.Timestamp scheduled_at = 4;
+  bool firing = 5;
+  double observed_value = 6;
+  double threshold_value = 7;
+  uint64 threshold_version = 8;
+  string threshold_kind = 9;
+  bool threshold_removed = 10;
+}

@@ -1,0 +1,16 @@
+go 1.27.2
+
+toolchain go1.27.4
+
+use (
+	./gen
+	./pkg
+	./services/api-gateway
+	./services/control-plane
+	./services/check-runner
+	./services/query-service
+	./services/stream-processor
+	./services/telemetry-ingestion
+	./tests
+	./tools
+)

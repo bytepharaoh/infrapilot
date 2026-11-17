@@ -1,0 +1,40 @@
+rule_files:
+  - ../rules/telemetry-ingestion.yaml
+evaluation_interval: 1m
+tests:
+  - name: sustained dependency failures and capacity rejection
+    interval: 1m
+    input_series:
+      - series: 'telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="accepted"}'
+        values: '0+600x20'
+      - series: 'telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="unavailable"}'
+        values: '0+120x20'
+      - series: 'telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="busy"}'
+        values: '0+120x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TelemetryIngestionUnavailable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: TelemetryIngestionUnavailable
+        exp_alerts:
+          - exp_labels: {severity: critical, job: telemetry-ingestion}
+            exp_annotations:
+              summary: "More than 5% of OTLP exports cannot reach a required dependency"
+              runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/telemetry-ingestion.md#telemetryingestionunavailable
+      - eval_time: 15m
+        alertname: TelemetryIngestionBackpressure
+        exp_alerts:
+          - exp_labels: {severity: warning, job: telemetry-ingestion}
+            exp_annotations:
+              summary: "OTLP admission is rejecting more than one export per second"
+              runbook_url: https://github.com/bytepharaoh/infrapilot/blob/main/docs/runbooks/telemetry-ingestion.md#telemetryingestionbackpressure
+  - name: per-tenant quota rejections do not page for service overload
+    interval: 1m
+    input_series:
+      - series: 'telemetry_ingestion_exports_total{job="telemetry-ingestion",outcome="quota"}'
+        values: '0+120x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TelemetryIngestionBackpressure
+        exp_alerts: []

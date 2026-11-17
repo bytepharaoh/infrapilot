@@ -1,0 +1,42 @@
+# Environment-specific reference values for CI production renders.
+environment: prod
+image:
+  tag: test
+extraEnv:
+  - name: REDIS_ADDR
+    value: redis.telemetry-deps.svc:6379
+  - name: REDIS_TLS
+    value: "true"
+  - name: REDIS_USERNAME
+    value: telemetry-ingestion
+  - name: KAFKA_BROKERS
+    value: kafka-bootstrap.telemetry-deps.svc:9093
+  - name: KAFKA_TLS_CA_FILE
+    value: /etc/infrapilot/kafka/ca.crt
+  - name: KAFKA_TLS_CERT_FILE
+    value: /etc/infrapilot/kafka/tls.crt
+  - name: KAFKA_TLS_KEY_FILE
+    value: /etc/infrapilot/kafka/tls.key
+extraVolumeMounts:
+  - name: kafka
+    mountPath: /etc/infrapilot/kafka
+    readOnly: true
+extraVolumes:
+  - name: kafka
+    secret:
+      secretName: telemetry-ingestion-kafka
+      defaultMode: 0440
+networkPolicy:
+  egress:
+    rules:
+      - to:
+          - podSelector: {matchLabels: {app.kubernetes.io/name: control-plane}}
+        ports: [{port: 9090, protocol: TCP}]
+      - to:
+          - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: telemetry-deps}}
+            podSelector: {matchLabels: {app: redis}}
+        ports: [{port: 6379, protocol: TCP}]
+      - to:
+          - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: telemetry-deps}}
+            podSelector: {matchLabels: {app: kafka}}
+        ports: [{port: 9093, protocol: TCP}]
